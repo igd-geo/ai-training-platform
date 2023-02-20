@@ -1,0 +1,53 @@
+---
+template: true
+---
+
+- id: train
+  name: train
+  description: train
+  path: "tensorflow/tensorflow:2.4.1-gpu"
+  runtime: docker
+  requiredCapabilities:
+    - gpu
+  parameters:
+    - id: program
+      name: program
+      description: program
+      type: input
+      cardinality: 1..1
+      dataType: string
+      default: "python3"
+    - id: argument
+      name: argument
+      description: argument
+      type: input
+      cardinality: 1..1
+      dataType: string
+  runtimeArgs:
+    - id: gpus
+      name: GPUs
+      description: Tells nvidia-docker which GPUs to use
+      label: "--gpus"
+      value: "all"
+
+- id: trainCPU
+  name: trainCPU
+  description: trainCPU
+  path: "tensorflow/tensorflow"
+  runtime: docker
+  requiredCapabilities:
+    - cpu
+  parameters:
+    - id: program
+      name: program
+      description: program
+      type: input
+      cardinality: 1..1
+      dataType: string
+      default: "python3"
+    - id: argument
+      name: argument
+      description: argument
+      type: input
+      cardinality: 1..1
+      dataType: string

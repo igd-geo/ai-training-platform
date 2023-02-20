@@ -1,0 +1,12 @@
+api: 4.2.0
+vars:
+  - id: argument
+    value: "/data/test.py"
+
+actions:
+  - type: execute
+    service: train
+    inputs:
+      - id: argument
+        var: argument
+

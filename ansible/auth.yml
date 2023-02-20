@@ -1,0 +1,10 @@
+ssh_key_private: /data/ansible/ansible_ed25519
+ssh_key_public: /data/ansible/ansible_ed25519.pub
+docker_user: my-gitlab-deploy-token
+docker_password: my-gitlab-deploy-token-password
+docker_url:  https://my-docker-registry.tld:4567
+git_repo: git.igd-r.fraunhofer.de/pact-wald/steep.git
+git_path: /home/ubuntu/platform
+steep_image: steep/steep:6.3.0
+nvidia_driver: https://us.download.nvidia.com/tesla/470.82.01/NVIDIA-Linux-x86_64-470.82.01.run
+update_script: /home/ubuntu/platform/check-for-updates.sh

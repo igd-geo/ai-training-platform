@@ -1,0 +1,381 @@
+#ansible-galaxy collection install community.docker
+#ansible-galaxy collection install ansible.posix
+---
+- name: General provisioning
+  hosts: all
+  become: yes
+  vars_files:
+    - auth.yml
+  tasks:
+    - name: Copy private ssh key
+      copy:
+        src: "{{ ssh_key_private }}"
+        dest: "/home/ubuntu/.ssh/id_ed25519"
+        owner: ubuntu
+        group: ubuntu
+        mode: 0600
+    - name: Copy public ssh key
+      copy:
+        src: "{{ ssh_key_public }}"
+        dest: "/home/ubuntu/.ssh/id_ed25519.pub"
+        mode: 0400
+        owner: ubuntu
+        group: ubuntu
+    - name: Add ssh key to authorized_keys
+      ansible.posix.authorized_key:
+        user: ubuntu
+        state: present
+        key: "{{ lookup('file', ssh_key_public) }}"
+        path: /home/ubuntu/.ssh/authorized_keys
+    - name: Get ssh key of main
+      shell: "ssh-keyscan -H {{ groups['main'][0] }}"
+      register: host_key
+    - name: Add main ssh key to known_hosts (ubuntu)
+      known_hosts:
+        path: /home/ubuntu/.ssh/known_hosts
+        name: "{{ groups['main'][0] }}"
+        key: "{{ host_key.stdout }}"
+        state: present
+    - name: Add main ssh key to known_hosts (root)
+      known_hosts:
+        path: /root/.ssh/known_hosts
+        name: "{{ groups['main'][0] }}"
+        key: "{{ host_key.stdout }}"
+        state: present
+    - name: Copy steep files
+      copy:
+        src: /data/conf
+        dest: /home/ubuntu/steep/
+        owner: ubuntu
+        group: ubuntu
+    - name: Install aptitude using apt
+      apt: name=aptitude state=latest update_cache=yes force_apt_get=yes
+    - name: Install required system packages
+      apt: name={{ item }} state=latest update_cache=yes
+      loop: [ 'apt-transport-https', 'ca-certificates', 'curl', 'software-properties-common', 'python3-pip', 'virtualenv', 'python3-setuptools']
+    - name: Add Docker GPG apt Key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+    - name: Add Docker Repository
+      apt_repository:
+        repo: deb https://download.docker.com/linux/ubuntu bionic stable
+        state: present
+    - name: Update apt and install docker-ce
+      apt: update_cache=yes name=docker-ce state=latest
+    - name: Install Docker Module for Python
+      pip:
+        name: "{{ item }}"
+      loop: [ 'docker', 'python-dateutil' ]
+    - name: adding existing user ubuntu to group docker
+      user:
+        name: 'ubuntu'
+        groups: docker
+        append: yes
+    - name: reset ssh connection to allow user changes to affect ansible user
+      ansible.builtin.meta:
+        reset_connection
+    - name: Login docker
+      become: yes
+      community.docker.docker_login:
+        username: "{{ docker_user }}"
+        password: "{{ docker_password }}"
+        registry_url: "{{ docker_url }}"
+        config_path: "/root/.docker/config.json"
+    - name: Make /local dir
+      ansible.builtin.file:
+        path: /local
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: 0777
+
+
+- name: sshfs mounting
+  hosts: cpu,gpu
+  become: yes
+  vars_files:
+    - auth.yml
+  tasks:
+    - name: Install sshfs
+      apt: name=sshfs
+    - name: Make /data dir
+      ansible.builtin.file:
+        path: /data
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: 0777
+    - name: Mount sshfs
+      ansible.posix.mount:
+        src: "sshfs#ubuntu@{{ groups['main'][0] }}:/data"
+        path: "/data"
+        opts: "allow_other,_netdev,default_permissions,IdentityFile=/home/ubuntu/.ssh/id_ed25519,ServerAliveInterval=15,ServerAliveCountMax=3,reconnect"
+        state: mounted
+        fstype: fuse
+
+
+- name: Main provisioning
+  hosts: main
+  become: yes
+  vars_files:
+    - auth.yml
+  tasks:
+    - name: Set /data permissions
+      ansible.builtin.file:
+        path: /data
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: 0777
+    - name: Make /data/tmp directory
+      ansible.builtin.file:
+        path: /data/tmp
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: 0777
+    - name: Make /data/steep/tmp directory
+      ansible.builtin.file:
+        path: /data/steep/tmp
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: 0777
+    - name: Clone git repo
+      become: no
+      ansible.builtin.git:
+        repo: "https://{{ docker_user }}:{{ docker_password }}@{{ git_repo }}"
+        dest: "{{ git_path }}"
+        update: yes
+        force: yes
+    - name: Ansible repository
+      ansible.builtin.apt_repository:
+        repo: ppa:ansible/ansible
+    - name: Install ansible
+      apt:
+        name: ansible
+    - name: Cron job for updating with ansible
+      ansible.builtin.cron:
+        name: "Update git repo and run ansible"
+        minute: "*/1"
+        job: bash {{ update_script }}
+        user: ubuntu
+    - name: Run Steep Main
+      tags:
+        - restartSteep
+      community.docker.docker_container:
+        image: "{{ steep_image }}"
+        name: steep
+        state: started
+        pull: yes
+        published_ports: 5701:5701,41187:41187,8080:8080
+        #auto_remove: yes
+        detach: yes
+        groups: ["docker"]
+        recreate: yes
+        restart: yes
+        restart_policy: always
+        env: {
+        "STEEP_TMPPATH":"/data/steep/tmp",
+  "STEEP_OUTPATH":"/data/steep/out",
+  "STEEP_HTTP_HOST":"0.0.0.0",
+  "STEEP_CLUSTER_EVENTBUS_HOST":"0.0.0.0",
+  "STEEP_CLUSTER_EVENTBUS_PORT":"41187",
+  "STEEP_CLUSTER_EVENTBUS_PUBLICHOST":"{{ ansible_default_ipv4.address }}" ,
+  "STEEP_CLUSTER_EVENTBUS_PUBLICPORT":"41187" ,
+  "STEEP_CLUSTER_HAZELCAST_CLUSTERNAME":"platform",
+  "STEEP_CLUSTER_HAZELCAST_PUBLICADDRESS":"{{ ansible_default_ipv4.address }}:5701",
+  "STEEP_CLUSTER_HAZELCAST_PORT":"5701",
+  "STEEP_CLUSTER_HAZELCAST_TCPENABLED":"true",
+  "STEEP_ONLYTRAVERSEDIRECTORYOUTPUTS":"true",
+  "STEEP_AGENT_ID":"main",
+  "STEEP_AGENT_CAPABILITIES":"[\"host\"]",
+  "STEEP_RUNTIMES_DOCKER_VOLUMES":"[/data:/data,\"/local:/local\"]",
+  "STEEP_DB_DRIVER":"mongodb",
+  "STEEP_DB_URL":"mongodb://{{ ansible_default_ipv4.address }}:27017/steep"
+        }
+        volumes: [ "/var/run/docker.sock:/var/run/docker.sock",
+  "/root/.docker/config.json:/root/.docker/config.json",
+  "/home/ubuntu/.docker/config.json:/home/steep/.docker/config.json",
+  "/data:/data",
+  "/local:/local",
+  "/home/ubuntu/steep/conf/services:/steep/conf/services",
+  "/home/ubuntu/steep/conf/plugins:/steep/conf/plugins"
+        ]
+
+
+- name: CPU provisioning
+  hosts: cpu
+  become: yes
+  vars_files:
+    - auth.yml
+  tasks:
+    - name: Fetch hostname
+      tags:
+        - restartSteep
+      shell: hostname
+      register: hostname
+    - name: Run Steep CPU
+      become: no
+      tags:
+        - restartSteep
+      community.docker.docker_container:
+        image: "{{ steep_image }}"
+        name: steep
+        state: started
+        pull: yes
+        published_ports: 5701:5701,41187:41187
+        #auto_remove: yes
+        detach: yes
+        recreate: yes
+        restart: yes
+        groups: ["docker"]
+        user: root
+        restart_policy: always
+        env: {
+        "STEEP_TMPPATH":"/data/steep/tmp",
+  "STEEP_OUTPATH":"/data/steep/out",
+  "STEEP_HTTP_HOST":"0.0.0.0",
+  "STEEP_CLUSTER_EVENTBUS_HOST":"0.0.0.0",
+  "STEEP_CLUSTER_EVENTBUS_PORT":"41187",
+  "STEEP_CLUSTER_EVENTBUS_PUBLICHOST":"{{ ansible_default_ipv4.address }}" ,
+  "STEEP_CLUSTER_EVENTBUS_PUBLICPORT":"41187" ,
+  "STEEP_CLUSTER_HAZELCAST_CLUSTERNAME":"platform",
+  "STEEP_CLUSTER_HAZELCAST_PUBLICADDRESS":"{{ ansible_default_ipv4.address }}:5701",
+  "STEEP_CLUSTER_HAZELCAST_PORT":"5701",
+  "STEEP_CLUSTER_HAZELCAST_TCPENABLED":"true",
+  "STEEP_ONLYTRAVERSEDIRECTORYOUTPUTS":"true",
+  "STEEP_AGENT_ID":"CPU {{groups['cpu'].index(inventory_hostname)}} - id {{ 100 | random }} - {{ hostname.stdout }} - {{ ansible_default_ipv4.address }}",
+  "STEEP_AGENT_CAPABILITIES":"[\"cpu\"]",
+  "STEEP_RUNTIMES_DOCKER_VOLUMES":"[/data:/data,\"/local:/local\"]",
+  "STEEP_CLUSTER_HAZELCAST_MEMBERS":"[ {{ groups['main'][0] }} ]",
+  "STEEP_HTTP_ENABLED":"false",
+  "STEEP_AGENT_ENABLED":"true",
+  "STEEP_CLOUD_ENABLED":"false",
+  "STEEP_LOGGING_ENABLEJSON":"false",
+  "STEEP_LOGS_MAIN_ENABLED":"true",
+  "STEEP_LOGS_PROCESSCHAINS_ENABLED":"true",
+  "STEEP_SCHEDULER_ENABLED":"false",
+  "STEEP_CONTROLLER_ENABLED":"false"
+        }
+        volumes: [ "/var/run/docker.sock:/var/run/docker.sock",
+  "/root/.docker/config.json:/root/.docker/config.json",
+  "/home/ubuntu/.docker/config.json:/home/steep/.docker/config.json",
+  "/data:/data",
+  "/local:/local",
+  "/home/ubuntu/steep/conf/services:/steep/conf/services"
+        ]
+
+
+- name: GPU provisioning
+  hosts: gpu
+  become: yes
+  vars_files:
+    - auth.yml
+  tasks:
+    - name: Read os version
+      shell: echo $(. /etc/os-release;echo $ID$VERSION_ID)
+      register: distribution
+    - name: Add Nvidia docker GPG apt Key
+      apt_key:
+        url: https://nvidia.github.io/nvidia-docker/gpgkey
+        state: present
+    - name: Add Nvidia Docker Repository
+      get_url:
+        url:  "https://nvidia.github.io/nvidia-docker/{{ distribution.stdout }}/nvidia-docker.list"
+        dest: /etc/apt/sources.list.d/nvidia-docker.list
+    - name: Install nvidia-container toolkit
+      apt:
+        name: [build-essential,nvidia-container-toolkit]
+        update_cache: yes
+    - name: Download nvidia driver installer
+      get_url:
+        url: "{{ nvidia_driver }}"
+        dest: /tmp/nvidia.sh
+        mode: 0755
+    - name: Get running docker containers
+      docker_host_info:
+        containers: yes
+      register: docker_info
+    - name: Stop running docker containers
+      docker_container:
+        name: "{{ item }}"
+        state: stopped
+      loop: "{{ docker_info.containers | map(attribute='Id') | list }}"
+    - name: Execute the nvidia driver installer
+      shell: /tmp/nvidia.sh --silent
+#    - name: Remove the nvidia driver installer
+#      file:
+#        path: /tmp/nvidia.sh
+#        state: absent
+    - name: Clone git repo
+      become: no
+      ansible.builtin.git:
+        repo: "https://{{ docker_user }}:{{ docker_password }}@{{ git_repo }}"
+        dest: "{{ git_path }}"
+        version: "master"
+        update: yes
+        force: yes
+    - name: Restart docker
+      tags:
+        - restartSteep
+      ansible.builtin.service:
+        name: docker
+        state: restarted
+    - name: Fetch hostname
+      tags:
+        - restartSteep
+      shell: hostname
+      register: hostname
+    - name: Run Steep GPU
+      become: no
+      tags:
+        - restartSteep
+      community.docker.docker_container:
+        image: "{{ steep_image }}"
+        name: steep
+        state: started
+        pull: yes
+        published_ports: 5701:5701,41187:41187
+#        auto_remove: yes
+        detach: yes
+        groups: ["docker"]
+        user: root
+        recreate: yes
+        restart: yes
+        restart_policy: always
+        env: {
+        "STEEP_TMPPATH":"/data/steep/tmp",
+  "STEEP_OUTPATH":"/data/steep/out",
+  "STEEP_HTTP_HOST":"0.0.0.0",
+  "STEEP_CLUSTER_EVENTBUS_HOST":"0.0.0.0",
+  "STEEP_CLUSTER_EVENTBUS_PORT":"41187",
+  "STEEP_CLUSTER_EVENTBUS_PUBLICHOST":"{{ ansible_default_ipv4.address }}" ,
+  "STEEP_CLUSTER_EVENTBUS_PUBLICPORT":"41187" ,
+  "STEEP_CLUSTER_HAZELCAST_CLUSTERNAME":"platform",
+  "STEEP_CLUSTER_HAZELCAST_PUBLICADDRESS":"{{ ansible_default_ipv4.address }}:5701",
+  "STEEP_CLUSTER_HAZELCAST_PORT":"5701",
+  "STEEP_CLUSTER_HAZELCAST_TCPENABLED":"true",
+  "STEEP_ONLYTRAVERSEDIRECTORYOUTPUTS":"true",
+  "STEEP_AGENT_ID":"GPU {{groups['gpu'].index(inventory_hostname)}} - id {{ 100 | random }} - {{ hostname.stdout }} - {{ ansible_default_ipv4.address }}",
+  "STEEP_AGENT_CAPABILITIES":"[\"gpu\"]",
+  "STEEP_RUNTIMES_DOCKER_VOLUMES":"[/data:/data,\"/local:/local\"]",
+  "STEEP_CLUSTER_HAZELCAST_MEMBERS":"[ {{ groups['main'][0] }} ]",
+  "STEEP_HTTP_ENABLED":"false",
+  "STEEP_AGENT_ENABLED":"true",
+  "STEEP_CLOUD_ENABLED":"false",
+  "STEEP_LOGGING_ENABLEJSON":"false",
+  "STEEP_LOGS_MAIN_ENABLED":"true",
+  "STEEP_LOGS_PROCESSCHAINS_ENABLED":"true",
+  "STEEP_SCHEDULER_ENABLED":"false",
+  "STEEP_CONTROLLER_ENABLED":"false"
+        }
+        volumes: [ "/var/run/docker.sock:/var/run/docker.sock",
+  "/root/.docker/config.json:/root/.docker/config.json",
+  "/home/ubuntu/.docker/config.json:/home/steep/.docker/config.json",
+  "/data:/data",
+  "/local:/local",
+  "/home/ubuntu/steep/conf/services:/steep/conf/services"
+        ]
+
