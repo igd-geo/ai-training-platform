@@ -1,3 +1,6 @@
+# Info
+This repo contains the setup scripts from the paper "A Scalable AI Training Platform for Remote Sensing Data" presented at Agile 2023.
+
 # Setup of the platform
 
 ## Structure of this repo
